@@ -8,4 +8,5 @@ edition = "2021"
 [build-dependencies]
 conan = "0.3"
 bindgen = "0.66"
+regex = "1.8.4"
 
