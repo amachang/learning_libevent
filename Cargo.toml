@@ -1,0 +1,11 @@
+[package]
+name = "learning_libevent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+conan = "0.3"
+bindgen = "0.66"
+
