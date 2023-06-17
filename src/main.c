@@ -86,15 +86,13 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 static void
 conn_readcb(struct bufferevent *bev, void *user_data)
 {
+    struct evbuffer* evbuf_in = bufferevent_get_input(bev);
+    struct evbuffer* evbuf_out = bufferevent_get_output(bev);
     char buf[1000];
     while (1) {
-        size_t reads = bufferevent_read(bev, buf, sizeof(buf));
-        if (reads == 0) {
-            break;
-        }
-        size_t result = bufferevent_write(bev, buf, reads);
-        if (result < 0) {
-            fprintf(stderr, "Error wrting to bufferevent!");
+        size_t inputs = evbuffer_get_length(evbuf_in);
+        size_t writes = evbuffer_remove_buffer(evbuf_in, evbuf_out, inputs);
+        if (inputs <= writes) {
             break;
         }
     }
