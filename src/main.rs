@@ -18,14 +18,48 @@ use std::{
     ffi::*,
 };
 
+#[derive(Debug)]
+struct EventError(String);
+
+#[derive(Debug)]
+struct EventBase {
+    base: NonNull<event_base>,
+}
+
+impl EventBase {
+    fn try_new() -> Result<EventBase, EventError> {
+        let base: Option<NonNull<event_base>> = NonNull::new(unsafe { event_base_new() });
+        match base {
+            None => Err(EventError("Could not initialize libevent!".into())),
+            Some(base) => Ok(EventBase { base }),
+        }
+    }
+
+    unsafe fn as_ptr(&self) -> *mut event_base {
+        self.base.as_ptr()
+    }
+}
+
+impl Drop for EventBase {
+    fn drop(&mut self) {
+        unsafe { event_base_free(self.base.as_ptr()) };
+    }
+}
+
 const PORT: u16 = 9995;
 
 fn main() {
-    let base: Option<NonNull<event_base>> = NonNull::new(unsafe { event_base_new() });
-    let Some(base) = base else {
-        eprintln!("Could not initialize libevent!");
-        exit(1);
-    };
+    match try_main() {
+        Err(err) => {
+            eprintln!("Error: {}", err.0);
+            exit(1);
+        },
+        _ => (),
+    }
+}
+
+fn try_main() -> Result<(), EventError> {
+    let base = EventBase::try_new()?;
 
     let mut sin: sockaddr_in = unsafe { zeroed() };
     sin.sin_family = AF_INET as u8;
@@ -69,9 +103,9 @@ fn main() {
 
     unsafe { evconnlistener_free(listener.as_ptr()) };
     unsafe { event_free(signal_event.as_ptr()) };
-    unsafe { event_base_free(base.as_ptr()) };
 
     println!("done");
+    Ok(())
 }
 
 fn htons(u: u16) -> u16 {
