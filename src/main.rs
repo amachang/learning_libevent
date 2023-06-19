@@ -46,6 +46,57 @@ impl Drop for EventBase {
     }
 }
 
+#[derive(Debug)]
+struct ConnectionListener {
+    listener: NonNull<evconnlistener>,
+}
+
+impl ConnectionListener {
+    fn try_new(base: &EventBase, port: u16) -> Result<ConnectionListener, EventError> {
+        let mut sin: sockaddr_in = unsafe { zeroed() };
+        sin.sin_family = AF_INET as u8;
+        sin.sin_port = htons(port);
+
+        let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(|fd: i32| {
+            let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(base.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
+            let Some(bev) = bev else {
+                eprintln!("Error constructing bufferevent!");
+                unsafe { event_base_loopbreak(base.as_ptr()) };
+                return;
+            };
+            unsafe { bufferevent_setcb(bev.as_ptr(), Some(conn_readcb), Some(conn_writecb), Some(conn_eventcb), null_mut()) };
+            unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
+        }));
+
+        extern "C" fn c_listener_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, listener_cb: *mut c_void) {
+            let listener_cb: &Box<dyn Fn(i32)> = unsafe { &*(listener_cb as *mut _) };
+            listener_cb(fd);
+        }
+
+        let listener: Option<NonNull<evconnlistener>> = NonNull::new(unsafe {
+            evconnlistener_new_bind(
+                base.as_ptr(),
+                Some(c_listener_cb),
+                Box::into_raw(listener_cb) as *mut _,
+                LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE,
+                -1,
+                &sin as *const sockaddr_in as *const sockaddr,
+                size_of::<sockaddr_in>() as i32,
+            )
+        });
+        match listener {
+            None => Err(EventError("Could not initialize connection Listener!".into())),
+            Some(listener) => Ok(ConnectionListener { listener }),
+        }
+    }
+}
+
+impl Drop for ConnectionListener {
+    fn drop(&mut self) {
+        unsafe { evconnlistener_free(self.listener.as_ptr()) };
+    }
+}
+
 const PORT: u16 = 9995;
 
 fn main() {
@@ -60,42 +111,7 @@ fn main() {
 
 fn try_main() -> Result<(), EventError> {
     let base = EventBase::try_new()?;
-
-    let mut sin: sockaddr_in = unsafe { zeroed() };
-    sin.sin_family = AF_INET as u8;
-    sin.sin_port = htons(PORT);
-
-    let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(|fd: i32| {
-        let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(base.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
-        let Some(bev) = bev else {
-            eprintln!("Error constructing bufferevent!");
-            unsafe { event_base_loopbreak(base.as_ptr()) };
-            return;
-        };
-        unsafe { bufferevent_setcb(bev.as_ptr(), Some(conn_readcb), Some(conn_writecb), Some(conn_eventcb), null_mut()) };
-        unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
-    }));
-
-    extern "C" fn c_listener_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, listener_cb: *mut c_void) {
-        let listener_cb: &Box<dyn Fn(i32)> = unsafe { &*(listener_cb as *mut _) };
-        listener_cb(fd);
-    }
-
-    let listener: Option<NonNull<evconnlistener>> = NonNull::new(unsafe {
-        evconnlistener_new_bind(
-            base.as_ptr(),
-            Some(c_listener_cb),
-            Box::into_raw(listener_cb) as *mut _,
-            LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE,
-            -1,
-            &sin as *const sockaddr_in as *const sockaddr,
-            size_of::<sockaddr_in>() as i32,
-        )
-    });
-    let Some(listener) = listener else {
-        eprintln!("Could not create a listener!");
-        exit(1);
-    };
+    let _listener = ConnectionListener::try_new(&base, PORT)?;
 
     let signal_event: Option<NonNull<event>> = NonNull::new(unsafe {
         event_new(base.as_ptr(), SIGINT as i32, (EV_SIGNAL | EV_PERSIST) as i16, Some(signal_cb), base.as_ptr() as *mut c_void)
@@ -117,7 +133,6 @@ fn try_main() -> Result<(), EventError> {
 
     unsafe { event_base_dispatch(base.as_ptr()) };
 
-    unsafe { evconnlistener_free(listener.as_ptr()) };
     unsafe { event_free(signal_event.as_ptr()) };
 
     println!("done");
