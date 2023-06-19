@@ -52,21 +52,12 @@ struct ConnectionListener {
 }
 
 impl ConnectionListener {
-    fn try_new(base: &EventBase, port: u16) -> Result<ConnectionListener, EventError> {
+    fn try_new(base: &EventBase, port: u16, listener_cb: impl Fn(i32)) -> Result<ConnectionListener, EventError> {
         let mut sin: sockaddr_in = unsafe { zeroed() };
         sin.sin_family = AF_INET as u8;
         sin.sin_port = htons(port);
 
-        let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(|fd: i32| {
-            let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(base.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
-            let Some(bev) = bev else {
-                eprintln!("Error constructing bufferevent!");
-                unsafe { event_base_loopbreak(base.as_ptr()) };
-                return;
-            };
-            unsafe { bufferevent_setcb(bev.as_ptr(), Some(conn_readcb), Some(conn_writecb), Some(conn_eventcb), null_mut()) };
-            unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
-        }));
+        let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(listener_cb));
 
         extern "C" fn c_listener_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, listener_cb: *mut c_void) {
             let listener_cb: &Box<dyn Fn(i32)> = unsafe { &*(listener_cb as *mut _) };
@@ -111,7 +102,16 @@ fn main() {
 
 fn try_main() -> Result<(), EventError> {
     let base = EventBase::try_new()?;
-    let _listener = ConnectionListener::try_new(&base, PORT)?;
+    let _listener = ConnectionListener::try_new(&base, PORT, |fd: i32| {
+        let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(base.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
+        let Some(bev) = bev else {
+            eprintln!("Error constructing bufferevent!");
+            unsafe { event_base_loopbreak(base.as_ptr()) };
+            return;
+        };
+        unsafe { bufferevent_setcb(bev.as_ptr(), Some(conn_readcb), Some(conn_writecb), Some(conn_eventcb), null_mut()) };
+        unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
+    })?;
 
     let signal_event: Option<NonNull<event>> = NonNull::new(unsafe {
         event_new(base.as_ptr(), SIGINT as i32, (EV_SIGNAL | EV_PERSIST) as i16, Some(signal_cb), base.as_ptr() as *mut c_void)
