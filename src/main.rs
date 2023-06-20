@@ -92,8 +92,8 @@ impl<'a> EventManager<'a> {
         Ok(())
     }
 
-    fn listen_socket(&mut self, lp: &EventLoop, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket), event_cb: impl Fn(&Socket, i16)) -> Result<(), EventError> {
-        let listener = SocketListener::try_new(lp, fd, read_cb, write_cb, event_cb)?;
+    fn listen_socket(&mut self, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket), event_cb: impl Fn(&Socket, i16)) -> Result<(), EventError> {
+        let listener = SocketListener::try_new(self.lp, fd, read_cb, write_cb, event_cb)?;
         self.socket_map.insert(fd, listener);
         Ok(())
     }
@@ -327,10 +327,7 @@ fn try_main() -> Result<(), EventError> {
     let manager_weak_ref = Rc::downgrade(&manager);
     manager.borrow_mut().bind_inet_port(&lp, PORT, move |fd: i32| {
         if let Some(manager) = manager_weak_ref.upgrade() {
-            let lp = manager.borrow().lp;
-
             let result = manager.borrow_mut().listen_socket(
-                lp,
                 fd,
                 move |socket| {
                     let mut in_buf = socket.input_buffer();
