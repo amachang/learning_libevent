@@ -267,11 +267,38 @@ impl Socket {
     fn new(bufferevent: NonNull<bufferevent>) -> Socket {
         Socket { bufferevent }
     }
+
+    fn input_buffer(&self) -> SocketBufferRef {
+        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(self.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+        SocketBufferRef { evbuffer }
+    }
+
+    fn output_buffer(&self) -> SocketBufferRef {
+        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(self.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+        SocketBufferRef { evbuffer }
+    }
+
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
         unsafe { bufferevent_free(self.bufferevent.as_ptr()) };
+    }
+}
+
+#[derive(Debug)]
+struct SocketBufferRef {
+    evbuffer: NonNull<evbuffer>
+}
+
+impl SocketBufferRef {
+    fn len(&mut self) -> usize {
+        unsafe { evbuffer_get_length(self.evbuffer.as_ptr()) }
+    }
+
+    fn move_data(&mut self, out_buf: &mut SocketBufferRef, size: usize) -> usize {
+        let writes = unsafe { evbuffer_remove_buffer(self.evbuffer.as_ptr(), out_buf.evbuffer.as_ptr(), size) };
+        writes as usize
     }
 }
 
@@ -303,11 +330,11 @@ fn try_main() -> Result<(), EventError> {
                     let manager_weak_ref = Rc::downgrade(&manager);
                     move |socket| {
                         if let Some(_manager) = manager_weak_ref.upgrade() {
-                            let evbuf_in: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(socket.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-                            let evbuf_out: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(socket.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+                            let mut in_buf = socket.input_buffer();
+                            let mut out_buf = socket.output_buffer();
                             loop {
-                                let inputs = unsafe { evbuffer_get_length(evbuf_in.as_ptr()) };
-                                let writes = unsafe { evbuffer_remove_buffer(evbuf_in.as_ptr(), evbuf_out.as_ptr(), inputs) } as usize;
+                                let inputs = in_buf.len();
+                                let writes = in_buf.move_data(&mut out_buf, inputs);
                                 if inputs <= writes {
                                     break;
                                 }
