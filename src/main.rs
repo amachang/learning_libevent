@@ -5,6 +5,7 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::{
+    collections::HashMap,
     rc::{
         Rc,
         Weak,
@@ -66,7 +67,7 @@ struct EventManager<'a> {
     lp: &'a EventLoop,
     connection_listeners: Vec<ConnectionListener>,
     signal_listeners: Vec<SignalListener>,
-    socket_listeners: Vec<SocketListener>,
+    socket_map: HashMap<i32, SocketListener>,
 }
 
 impl<'a> EventManager<'a> {
@@ -75,7 +76,7 @@ impl<'a> EventManager<'a> {
             lp,
             connection_listeners: vec![],
             signal_listeners: vec![],
-            socket_listeners: vec![],
+            socket_map: HashMap::new(),
         }
     }
 
@@ -93,8 +94,12 @@ impl<'a> EventManager<'a> {
 
     fn listen_socket(&mut self, lp: &EventLoop, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket), event_cb: impl Fn(&Socket, i16)) -> Result<(), EventError> {
         let listener = SocketListener::try_new(lp, fd, read_cb, write_cb, event_cb)?;
-        self.socket_listeners.push(listener);
+        self.socket_map.insert(fd, listener);
         Ok(())
+    }
+
+    fn unlisten_socket(&mut self, socket: &Socket) {
+        self.socket_map.remove(&socket.fd);
     }
 }
 
@@ -200,7 +205,7 @@ impl SocketListener {
             return Err(EventError("Error constructing bufferevent!".into()))
         };
 
-        let socket = Rc::new(Socket::new(bufferevent));
+        let socket = Rc::new(Socket::new(fd, bufferevent));
         let socket_weak_ref = Rc::downgrade(&socket);
 
         let ctx: Box<(
@@ -260,12 +265,13 @@ impl SocketListener {
 
 #[derive(Debug)]
 struct Socket {
+    fd: i32,
     bufferevent: NonNull<bufferevent>,
 }
 
 impl Socket {
-    fn new(bufferevent: NonNull<bufferevent>) -> Socket {
-        Socket { bufferevent }
+    fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Socket {
+        Socket { fd, bufferevent }
     }
 
     fn input_buffer(&self) -> SocketBufferRef {
@@ -347,8 +353,8 @@ fn try_main() -> Result<(), EventError> {
                     let manager_weak_ref = Rc::downgrade(&manager);
                     move |socket| {
                         if let Some(_manager) = manager_weak_ref.upgrade() {
-                            let output: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(socket.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-                            let remaining_outputs = unsafe { evbuffer_get_length(output.as_ptr()) };
+                            let mut out_buf = socket.output_buffer();
+                            let remaining_outputs = out_buf.len();
                             if remaining_outputs == 0 {
                                 println!("Answered");
                             }
@@ -358,7 +364,7 @@ fn try_main() -> Result<(), EventError> {
                 {
                     let manager_weak_ref = Rc::downgrade(&manager);
                     move |socket, events| {
-                        if let Some(_manager) = manager_weak_ref.upgrade() {
+                        if let Some(manager) = manager_weak_ref.upgrade() {
                             if (events & BEV_EVENT_READING as i16) != 0 {
                                 eprintln!("Error encountered while reading.");
                             }
@@ -382,8 +388,7 @@ fn try_main() -> Result<(), EventError> {
                             if (events & BEV_EVENT_CONNECTED as i16) != 0 {
                                 eprintln!("Connect operation finished.");
                             }
-
-                            unsafe { bufferevent_free(socket.bufferevent.as_ptr()) };
+                            manager.borrow_mut().unlisten_socket(socket);
                         }
                     }
                 },
