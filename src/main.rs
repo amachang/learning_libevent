@@ -88,6 +88,50 @@ impl Drop for ConnectionListener {
     }
 }
 
+#[derive(Debug)]
+struct SignalListener {
+    event: NonNull<event>,
+}
+
+impl SignalListener {
+    fn try_new(base: &EventBase, sig: u32, listener_cb: impl Fn(i16)) -> Result<SignalListener, EventError> {
+        let listener_cb: Box<Box<dyn Fn(i16)>> = Box::new(Box::new(listener_cb));
+
+        extern "C" fn c_listener_cb(_sig: i32, events: i16, listener_cb: *mut c_void) {
+            let listener_cb: &Box<dyn Fn(i16)> = unsafe { &*(listener_cb as *mut _) };
+            listener_cb(events);
+        }
+
+        let event: Option<NonNull<event>> = NonNull::new(unsafe {
+            event_new(
+                base.as_ptr(),
+                sig as i32,
+                (EV_SIGNAL | EV_PERSIST) as i16,
+                Some(c_listener_cb),
+                Box::into_raw(listener_cb) as *mut _
+            )
+        });
+
+        let Some(event) = event else {
+            return Err(EventError("Could not create a signal event!".into()));
+        };
+
+        let add_result = unsafe { event_add(event.as_ptr(), null()) };
+
+        if add_result < 0 {
+            return Err(EventError("Could not add a signal event!".into()));
+        };
+
+        Ok(SignalListener { event })
+    }
+}
+
+impl Drop for SignalListener {
+    fn drop(&mut self) {
+        unsafe { event_free(self.event.as_ptr()) };
+    }
+}
+
 const PORT: u16 = 9995;
 
 fn main() {
@@ -102,7 +146,7 @@ fn main() {
 
 fn try_main() -> Result<(), EventError> {
     let base = EventBase::try_new()?;
-    let _listener = ConnectionListener::try_new(&base, PORT, |fd: i32| {
+    let _connection_listener = ConnectionListener::try_new(&base, PORT, |fd: i32| {
         let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(base.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
         let Some(bev) = bev else {
             eprintln!("Error constructing bufferevent!");
@@ -113,27 +157,18 @@ fn try_main() -> Result<(), EventError> {
         unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
     })?;
 
-    let signal_event: Option<NonNull<event>> = NonNull::new(unsafe {
-        event_new(base.as_ptr(), SIGINT as i32, (EV_SIGNAL | EV_PERSIST) as i16, Some(signal_cb), base.as_ptr() as *mut c_void)
+    let _signal_listener = SignalListener::try_new(&base, SIGINT, |_events: i16| {
+        let delay: timeval = timeval { tv_sec: 2, tv_usec: 0 };
+
+        println!("Caught an interrupt signal; exiting cleanly in two seconds.");
+
+        unsafe { event_base_loopexit(base.as_ptr(), &delay) };
     });
 
-    let Some(signal_event) = signal_event else {
-        eprintln!("Could not create a signal event!");
-        exit(1);
-    };
-
-    let add_result = unsafe { event_add(signal_event.as_ptr(), null()) };
-
-    if add_result < 0 {
-        eprintln!("Could not create/add a signal event!");
-        exit(1);
-    }
 
     println!("Start listening the port: {}", PORT);
 
     unsafe { event_base_dispatch(base.as_ptr()) };
-
-    unsafe { event_free(signal_event.as_ptr()) };
 
     println!("done");
     Ok(())
@@ -196,11 +231,3 @@ extern "C" fn conn_eventcb(bev: *mut bufferevent, events: i16, _user_data: *mut 
     unsafe { bufferevent_free(bev.as_ptr()) };
 }
 
-extern "C" fn signal_cb(_sig: i32, _events: c_short, user_data: *mut c_void) {
-    let base: NonNull<event_base> = NonNull::new(user_data as *mut event_base).expect("Could not convert base pointer");
-    let delay: timeval = timeval { tv_sec: 2, tv_usec: 0 };
-
-    println!("Caught an interrupt signal; exiting cleanly in two seconds.");
-
-    unsafe { event_base_loopexit(base.as_ptr(), &delay) };
-}
