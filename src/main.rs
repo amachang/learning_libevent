@@ -35,6 +35,10 @@ impl EventBase {
         }
     }
 
+    fn run(&self) {
+        unsafe { event_base_dispatch(self.base.as_ptr()) };
+    }
+
     unsafe fn as_ptr(&self) -> *mut event_base {
         self.base.as_ptr()
     }
@@ -165,10 +169,9 @@ fn try_main() -> Result<(), EventError> {
         unsafe { event_base_loopexit(base.as_ptr(), &delay) };
     });
 
-
     println!("Start listening the port: {}", PORT);
 
-    unsafe { event_base_dispatch(base.as_ptr()) };
+    base.run();
 
     println!("done");
     Ok(())
