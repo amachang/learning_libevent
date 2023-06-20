@@ -332,33 +332,23 @@ fn try_main() -> Result<(), EventError> {
             let result = manager.borrow_mut().listen_socket(
                 lp,
                 fd,
-                {
-                    let manager_weak_ref = Rc::downgrade(&manager);
-                    move |socket| {
-                        if let Some(_manager) = manager_weak_ref.upgrade() {
-                            let mut in_buf = socket.input_buffer();
-                            let mut out_buf = socket.output_buffer();
-                            loop {
-                                let inputs = in_buf.len();
-                                let writes = in_buf.move_data(&mut out_buf, inputs);
-                                if inputs <= writes {
-                                    break;
-                                }
-                            };
-                            println!("Received");
+                move |socket| {
+                    let mut in_buf = socket.input_buffer();
+                    let mut out_buf = socket.output_buffer();
+                    loop {
+                        let inputs = in_buf.len();
+                        let writes = in_buf.move_data(&mut out_buf, inputs);
+                        if inputs <= writes {
+                            break;
                         }
-                    }
+                    };
+                    println!("Received");
                 },
-                {
-                    let manager_weak_ref = Rc::downgrade(&manager);
-                    move |socket| {
-                        if let Some(_manager) = manager_weak_ref.upgrade() {
-                            let mut out_buf = socket.output_buffer();
-                            let remaining_outputs = out_buf.len();
-                            if remaining_outputs == 0 {
-                                println!("Answered");
-                            }
-                        }
+                move |socket| {
+                    let mut out_buf = socket.output_buffer();
+                    let remaining_outputs = out_buf.len();
+                    if remaining_outputs == 0 {
+                        println!("Answered");
                     }
                 },
                 {
