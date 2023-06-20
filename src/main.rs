@@ -92,8 +92,28 @@ impl<'a> EventManager<'a> {
         Ok(())
     }
 
-    fn listen_socket(&mut self, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket), event_cb: impl Fn(&Socket, i16)) -> Result<(), EventError> {
-        let listener = SocketListener::try_new(self.lp, fd, read_cb, write_cb, event_cb)?;
+    fn listen_socket(&mut self, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket)) -> Result<(), EventError> {
+        let listener = SocketListener::try_new(self.lp, fd, read_cb, write_cb, |socket, events| {
+            if (events & BEV_EVENT_READING as i16) != 0 {
+                eprintln!("Event ocurred in reading.");
+            }
+            if (events & BEV_EVENT_WRITING as i16) != 0 {
+                eprintln!("Event ocurred in writing.");
+            }
+            if (events & BEV_EVENT_EOF as i16) != 0 {
+                eprintln!("Eof reached.");
+            }
+            if (events & BEV_EVENT_ERROR as i16) != 0 {
+                eprintln!("Unrecoverable error encountered.");
+            }
+            if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
+                eprintln!("User-specified timeout reached.");
+            }
+            if (events & BEV_EVENT_CONNECTED as i16) != 0 {
+                eprintln!("Connect operation finished.");
+            }
+            self.unlisten_socket(socket);
+        })?;
         self.socket_map.insert(fd, listener);
         Ok(())
     }
@@ -199,7 +219,7 @@ struct SocketListener {
 }
 
 impl SocketListener {
-    fn try_new(lp: &EventLoop, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket), event_cb: impl Fn(&Socket, i16)) -> Result<SocketListener, EventError> {
+    fn try_new(lp: &EventLoop, fd: i32, read_cb: impl FnMut(&Socket), write_cb: impl FnMut(&Socket), event_cb: impl FnMut(&Socket, i16)) -> Result<SocketListener, EventError> {
         let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(lp.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
         let Some(bufferevent) = bufferevent else {
             return Err(EventError("Error constructing bufferevent!".into()))
@@ -210,18 +230,18 @@ impl SocketListener {
 
         let ctx: Box<(
             Weak<Socket>,
-            Box<dyn Fn(&Socket)>,
-            Box<dyn Fn(&Socket)>,
-            Box<dyn Fn(&Socket, i16)>
+            Box<dyn FnMut(&Socket)>,
+            Box<dyn FnMut(&Socket)>,
+            Box<dyn FnMut(&Socket, i16)>
         )> = Box::new((socket_weak_ref, Box::new(read_cb), Box::new(write_cb), Box::new(event_cb)));
 
         extern "C" fn c_read_cb(bev: *mut bufferevent, ctx: *mut c_void) {
-            let ctx: &(
+            let ctx: &mut (
                 Weak<Socket>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket, i16)>
-            ) = unsafe { &*(ctx as *mut _) };
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket, i16)>
+            ) = unsafe { &mut *(ctx as *mut _) };
             let (socket_weak_ref, read_cb, _write_cb, _event_cb) = ctx;
             if let Some(socket) = socket_weak_ref.upgrade() {
                 assert_eq!(socket.bufferevent.as_ptr(), bev);
@@ -230,12 +250,12 @@ impl SocketListener {
         }
 
         extern "C" fn c_write_cb(bev: *mut bufferevent, ctx: *mut c_void) {
-            let ctx: &(
+            let ctx: &mut (
                 Weak<Socket>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket, i16)>
-            ) = unsafe { &*(ctx as *mut _) };
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket, i16)>
+            ) = unsafe { &mut *(ctx as *mut _) };
             let (socket_weak_ref, _read_cb, write_cb, _event_cb) = ctx;
             if let Some(socket) = socket_weak_ref.upgrade() {
                 assert_eq!(socket.bufferevent.as_ptr(), bev);
@@ -244,12 +264,12 @@ impl SocketListener {
         }
 
         extern "C" fn c_event_cb(bev: *mut bufferevent, events: i16, ctx: *mut c_void) {
-            let ctx: &(
+            let ctx: &mut (
                 Weak<Socket>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket)>,
-                Box<dyn Fn(&Socket, i16)>
-            ) = unsafe { &*(ctx as *mut _) };
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket)>,
+                Box<dyn FnMut(&Socket, i16)>
+            ) = unsafe { &mut *(ctx as *mut _) };
             let (socket_weak_ref, _read_cb, _write_cb, event_cb) = ctx;
             if let Some(socket) = socket_weak_ref.upgrade() {
                 assert_eq!(socket.bufferevent.as_ptr(), bev);
@@ -346,37 +366,6 @@ fn try_main() -> Result<(), EventError> {
                     let remaining_outputs = out_buf.len();
                     if remaining_outputs == 0 {
                         println!("Answered");
-                    }
-                },
-                {
-                    let manager_weak_ref = Rc::downgrade(&manager);
-                    move |socket, events| {
-                        if let Some(manager) = manager_weak_ref.upgrade() {
-                            if (events & BEV_EVENT_READING as i16) != 0 {
-                                eprintln!("Error encountered while reading.");
-                            }
-
-                            if (events & BEV_EVENT_WRITING as i16) != 0 {
-                                eprintln!("Error encountered while writing.");
-                            }
-
-                            if (events & BEV_EVENT_EOF as i16) != 0 {
-                                eprintln!("Eof reached.");
-                            }
-
-                            if (events & BEV_EVENT_ERROR as i16) != 0 {
-                                eprintln!("Unrecoverable error encountered.");
-                            }
-
-                            if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
-                                eprintln!("User-specified timeout reached.");
-                            }
-
-                            if (events & BEV_EVENT_CONNECTED as i16) != 0 {
-                                eprintln!("Connect operation finished.");
-                            }
-                            manager.borrow_mut().unlisten_socket(socket);
-                        }
                     }
                 },
             );
