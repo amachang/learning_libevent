@@ -39,6 +39,13 @@ impl EventBase {
         unsafe { event_base_dispatch(self.base.as_ptr()) };
     }
 
+    fn exit(&self, sec: f64) {
+        let tv_sec = sec.floor() as i64;
+        let tv_usec = ((sec - sec.floor()) * 1_000_000f64) as i32;
+        let delay: timeval = timeval { tv_sec, tv_usec };
+        unsafe { event_base_loopexit(self.base.as_ptr(), &delay) };
+    }
+
     unsafe fn as_ptr(&self) -> *mut event_base {
         self.base.as_ptr()
     }
@@ -59,7 +66,7 @@ impl ConnectionListener {
     fn try_new(base: &EventBase, port: u16, listener_cb: impl Fn(i32)) -> Result<ConnectionListener, EventError> {
         let mut sin: sockaddr_in = unsafe { zeroed() };
         sin.sin_family = AF_INET as u8;
-        sin.sin_port = htons(port);
+        sin.sin_port = Self::htons(port);
 
         let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(listener_cb));
 
@@ -83,6 +90,10 @@ impl ConnectionListener {
             None => Err(EventError("Could not initialize connection Listener!".into())),
             Some(listener) => Ok(ConnectionListener { listener }),
         }
+    }
+
+    fn htons(u: u16) -> u16 {
+        u.to_be()
     }
 }
 
@@ -157,80 +168,73 @@ fn try_main() -> Result<(), EventError> {
             unsafe { event_base_loopbreak(base.as_ptr()) };
             return;
         };
-        unsafe { bufferevent_setcb(bev.as_ptr(), Some(conn_readcb), Some(conn_writecb), Some(conn_eventcb), null_mut()) };
+
+        extern "C" fn c_write_cb(bev: *mut bufferevent, _user_data: *mut c_void)
+        {
+            let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
+            let output: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+            let remaining_outputs = unsafe { evbuffer_get_length(output.as_ptr()) };
+            if remaining_outputs == 0 {
+                println!("Answered");
+            }
+        }
+
+        extern "C" fn c_read_cb(bev: *mut bufferevent, _user_data: *mut c_void) {
+            let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
+            let evbuf_in: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+            let evbuf_out: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+            loop {
+                let inputs = unsafe { evbuffer_get_length(evbuf_in.as_ptr()) };
+                let writes = unsafe { evbuffer_remove_buffer(evbuf_in.as_ptr(), evbuf_out.as_ptr(), inputs) } as usize;
+                if inputs <= writes {
+                    break;
+                }
+            };
+            println!("Received");
+        }
+
+        extern "C" fn c_event_cb(bev: *mut bufferevent, events: i16, _user_data: *mut c_void) {
+            let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
+            if (events & BEV_EVENT_READING as i16) != 0 {
+                eprintln!("Error encountered while reading.");
+            }
+
+            if (events & BEV_EVENT_WRITING as i16) != 0 {
+                eprintln!("Error encountered while writing.");
+            }
+
+            if (events & BEV_EVENT_EOF as i16) != 0 {
+                eprintln!("Eof reached.");
+            }
+
+            if (events & BEV_EVENT_ERROR as i16) != 0 {
+                eprintln!("Unrecoverable error encountered.");
+            }
+
+            if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
+                eprintln!("User-specified timeout reached.");
+            }
+
+            if (events & BEV_EVENT_CONNECTED as i16) != 0 {
+                eprintln!("Connect operation finished.");
+            }
+
+            unsafe { bufferevent_free(bev.as_ptr()) };
+        }
+
+        unsafe { bufferevent_setcb(bev.as_ptr(), Some(c_read_cb), Some(c_write_cb), Some(c_event_cb), null_mut()) };
         unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
     })?;
 
     let _signal_listener = SignalListener::try_new(&base, SIGINT, |_events: i16| {
-        let delay: timeval = timeval { tv_sec: 2, tv_usec: 0 };
-
         println!("Caught an interrupt signal; exiting cleanly in two seconds.");
-
-        unsafe { event_base_loopexit(base.as_ptr(), &delay) };
+        base.exit(2.0);
     });
 
     println!("Start listening the port: {}", PORT);
-
     base.run();
 
     println!("done");
     Ok(())
-}
-
-fn htons(u: u16) -> u16 {
-    u.to_be()
-}
-
-extern "C" fn conn_writecb(bev: *mut bufferevent, _user_data: *mut c_void)
-{
-    let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-    let output: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-    let remaining_outputs = unsafe { evbuffer_get_length(output.as_ptr()) };
-    if remaining_outputs == 0 {
-        println!("Answered");
-    }
-}
-
-extern "C" fn conn_readcb(bev: *mut bufferevent, _user_data: *mut c_void) {
-    let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-    let evbuf_in: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-    let evbuf_out: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-    loop {
-        let inputs = unsafe { evbuffer_get_length(evbuf_in.as_ptr()) };
-        let writes = unsafe { evbuffer_remove_buffer(evbuf_in.as_ptr(), evbuf_out.as_ptr(), inputs) } as usize;
-        if inputs <= writes {
-            break;
-        }
-    };
-    println!("Received");
-}
-
-extern "C" fn conn_eventcb(bev: *mut bufferevent, events: i16, _user_data: *mut c_void) {
-    let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-    if (events & BEV_EVENT_READING as i16) != 0 {
-        eprintln!("Error encountered while reading.");
-    }
-
-    if (events & BEV_EVENT_WRITING as i16) != 0 {
-        eprintln!("Error encountered while writing.");
-    }
-
-    if (events & BEV_EVENT_EOF as i16) != 0 {
-        eprintln!("Eof reached.");
-    }
-
-    if (events & BEV_EVENT_ERROR as i16) != 0 {
-        eprintln!("Unrecoverable error encountered.");
-    }
-
-    if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
-        eprintln!("User-specified timeout reached.");
-    }
-
-    if (events & BEV_EVENT_CONNECTED as i16) != 0 {
-        eprintln!("Connect operation finished.");
-    }
-
-    unsafe { bufferevent_free(bev.as_ptr()) };
 }
 
