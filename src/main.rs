@@ -14,7 +14,6 @@ use std::{
     process::exit,
     ptr::{
         null,
-        null_mut,
         NonNull,
     },
     ffi::*,
@@ -64,6 +63,7 @@ struct EventManager<'a> {
     lp: &'a EventLoop,
     connection_listeners: Vec<ConnectionListener>,
     signal_listeners: Vec<SignalListener>,
+    socket_listeners: Vec<SocketListener>,
 }
 
 impl<'a> EventManager<'a> {
@@ -72,6 +72,7 @@ impl<'a> EventManager<'a> {
             lp,
             connection_listeners: vec![],
             signal_listeners: vec![],
+            socket_listeners: vec![],
         }
     }
 
@@ -84,6 +85,12 @@ impl<'a> EventManager<'a> {
     fn handle_signal(&mut self, lp: &EventLoop, sig: u32, cb: impl Fn(i16)) -> Result<(), EventError> {
         let listener = SignalListener::try_new(lp, sig, cb)?;
         self.signal_listeners.push(listener);
+        Ok(())
+    }
+
+    fn listen_socket(&mut self, lp: &EventLoop, fd: i32, read_cb: impl Fn(NonNull<bufferevent>), write_cb: impl Fn(NonNull<bufferevent>), event_cb: impl Fn(NonNull<bufferevent>, i16)) -> Result<(), EventError> {
+        let listener = SocketListener::try_new(lp, fd, read_cb, write_cb, event_cb)?;
+        self.socket_listeners.push(listener);
         Ok(())
     }
 }
@@ -178,6 +185,66 @@ impl Drop for SignalListener {
     }
 }
 
+#[derive(Debug)]
+struct SocketListener {
+    bufferevent: NonNull<bufferevent>,
+}
+
+impl SocketListener {
+    fn try_new(lp: &EventLoop, fd: i32, read_cb: impl Fn(NonNull<bufferevent>), write_cb: impl Fn(NonNull<bufferevent>), event_cb: impl Fn(NonNull<bufferevent>, i16)) -> Result<SocketListener, EventError> {
+        let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(lp.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
+        let Some(bufferevent) = bufferevent else {
+            return Err(EventError("Error constructing bufferevent!".into()))
+        };
+
+        let cbs: Box<
+            (
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>, i16)>
+            )
+        > = Box::new((Box::new(read_cb), Box::new(write_cb), Box::new(event_cb)));
+
+
+        extern "C" fn c_read_cb(bev: *mut bufferevent, cbs: *mut c_void) {
+            let cbs: &(
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>, i16)>
+            ) = unsafe { &*(cbs as *mut _) };
+            (cbs.0)(unsafe { NonNull::new_unchecked(bev) })
+        }
+
+        extern "C" fn c_write_cb(bev: *mut bufferevent, cbs: *mut c_void) {
+            let cbs: &(
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>, i16)>
+            ) = unsafe { &*(cbs as *mut _) };
+            (cbs.1)(unsafe { NonNull::new_unchecked(bev) })
+        }
+
+        extern "C" fn c_event_cb(bev: *mut bufferevent, events: i16, cbs: *mut c_void) {
+            let cbs: &(
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>)>,
+                Box<dyn Fn(NonNull<bufferevent>, i16)>
+            ) = unsafe { &*(cbs as *mut _) };
+            (cbs.2)(unsafe { NonNull::new_unchecked(bev) }, events)
+        }
+
+        unsafe { bufferevent_setcb(bufferevent.as_ptr(), Some(c_read_cb), Some(c_write_cb), Some(c_event_cb), Box::into_raw(cbs) as *mut _) };
+        unsafe { bufferevent_enable(bufferevent.as_ptr(), (EV_WRITE | EV_READ) as i16) };
+        Ok(SocketListener { bufferevent })
+    }
+}
+
+impl Drop for SocketListener {
+    fn drop(&mut self) {
+        unsafe { bufferevent_free(self.bufferevent.as_ptr()) };
+    }
+}
+
 const PORT: u16 = 9995;
 
 fn main() {
@@ -195,76 +262,83 @@ fn try_main() -> Result<(), EventError> {
     let manager = Rc::new(RefCell::new(EventManager::new(&lp)));
 
     let manager_weak_ref = Rc::downgrade(&manager);
-    manager.borrow_mut().bind_inet_port(&lp, PORT, |fd: i32| {
+    manager.borrow_mut().bind_inet_port(&lp, PORT, move |fd: i32| {
         if let Some(manager) = manager_weak_ref.upgrade() {
             let lp = manager.borrow().lp;
-            let bev: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(lp.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
-            let Some(bev) = bev else {
-                eprintln!("Error constructing bufferevent!");
-                unsafe { event_base_loopbreak(lp.as_ptr()) };
-                return;
-            };
 
-            extern "C" fn c_write_cb(bev: *mut bufferevent, _user_data: *mut c_void)
-            {
-                let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-                let output: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-                let remaining_outputs = unsafe { evbuffer_get_length(output.as_ptr()) };
-                if remaining_outputs == 0 {
-                    println!("Answered");
-                }
-            }
-
-            extern "C" fn c_read_cb(bev: *mut bufferevent, _user_data: *mut c_void) {
-                let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-                let evbuf_in: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-                let evbuf_out: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
-                loop {
-                    let inputs = unsafe { evbuffer_get_length(evbuf_in.as_ptr()) };
-                    let writes = unsafe { evbuffer_remove_buffer(evbuf_in.as_ptr(), evbuf_out.as_ptr(), inputs) } as usize;
-                    if inputs <= writes {
-                        break;
+            let result = manager.borrow_mut().listen_socket(
+                lp,
+                fd,
+                {
+                    let manager_weak_ref = Rc::downgrade(&manager);
+                    move |bev: NonNull<bufferevent>| {
+                        if let Some(_manager) = manager_weak_ref.upgrade() {
+                            let evbuf_in: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+                            let evbuf_out: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+                            loop {
+                                let inputs = unsafe { evbuffer_get_length(evbuf_in.as_ptr()) };
+                                let writes = unsafe { evbuffer_remove_buffer(evbuf_in.as_ptr(), evbuf_out.as_ptr(), inputs) } as usize;
+                                if inputs <= writes {
+                                    break;
+                                }
+                            };
+                            println!("Received");
+                        }
                     }
-                };
-                println!("Received");
-            }
+                },
+                {
+                    let manager_weak_ref = Rc::downgrade(&manager);
+                    move |bev: NonNull<bufferevent>| {
+                        if let Some(_manager) = manager_weak_ref.upgrade() {
+                            let output: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(bev.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+                            let remaining_outputs = unsafe { evbuffer_get_length(output.as_ptr()) };
+                            if remaining_outputs == 0 {
+                                println!("Answered");
+                            }
+                        }
+                    }
+                },
+                {
+                    let manager_weak_ref = Rc::downgrade(&manager);
+                    move |bev: NonNull<bufferevent>, events: i16| {
+                        if let Some(_manager) = manager_weak_ref.upgrade() {
+                            if (events & BEV_EVENT_READING as i16) != 0 {
+                                eprintln!("Error encountered while reading.");
+                            }
 
-            extern "C" fn c_event_cb(bev: *mut bufferevent, events: i16, _user_data: *mut c_void) {
-                let bev: NonNull<bufferevent> = NonNull::new(bev).expect("buffer event pointer shoudn't be null");
-                if (events & BEV_EVENT_READING as i16) != 0 {
-                    eprintln!("Error encountered while reading.");
-                }
+                            if (events & BEV_EVENT_WRITING as i16) != 0 {
+                                eprintln!("Error encountered while writing.");
+                            }
 
-                if (events & BEV_EVENT_WRITING as i16) != 0 {
-                    eprintln!("Error encountered while writing.");
-                }
+                            if (events & BEV_EVENT_EOF as i16) != 0 {
+                                eprintln!("Eof reached.");
+                            }
 
-                if (events & BEV_EVENT_EOF as i16) != 0 {
-                    eprintln!("Eof reached.");
-                }
+                            if (events & BEV_EVENT_ERROR as i16) != 0 {
+                                eprintln!("Unrecoverable error encountered.");
+                            }
 
-                if (events & BEV_EVENT_ERROR as i16) != 0 {
-                    eprintln!("Unrecoverable error encountered.");
-                }
+                            if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
+                                eprintln!("User-specified timeout reached.");
+                            }
 
-                if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
-                    eprintln!("User-specified timeout reached.");
-                }
+                            if (events & BEV_EVENT_CONNECTED as i16) != 0 {
+                                eprintln!("Connect operation finished.");
+                            }
 
-                if (events & BEV_EVENT_CONNECTED as i16) != 0 {
-                    eprintln!("Connect operation finished.");
-                }
-
-                unsafe { bufferevent_free(bev.as_ptr()) };
-            }
-
-            unsafe { bufferevent_setcb(bev.as_ptr(), Some(c_read_cb), Some(c_write_cb), Some(c_event_cb), null_mut()) };
-            unsafe { bufferevent_enable(bev.as_ptr(), (EV_WRITE | EV_READ) as i16) };
+                            unsafe { bufferevent_free(bev.as_ptr()) };
+                        }
+                    }
+                },
+            );
+            if let Err(_err) = result {
+                todo!();
+            };
         }
     })?;
 
     let manager_weak_ref = Rc::downgrade(&manager);
-    manager.borrow_mut().handle_signal(&lp, SIGINT, |_events: i16| {
+    manager.borrow_mut().handle_signal(&lp, SIGINT, move |_events: i16| {
         if let Some(manager) = manager_weak_ref.upgrade() {
             let lp = manager.borrow().lp;
             println!("Caught an interrupt signal; exiting cleanly in two seconds.");
