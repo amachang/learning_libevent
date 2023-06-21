@@ -25,7 +25,8 @@ struct EventLoopDataHolder {
     signal_ctx_ptrs: Vec<NonNull<CallbackContext<Box<dyn Fn(u32, i16)>, u32>>>,
     signal_events: Vec<NonNull<event>>,
     socket_map: HashMap<i32, Rc<Socket>>,
-    last_err: Option<EventError>,
+    socket_errs: Vec<EventError>,
+    break_reason_err: Option<EventError>,
 }
 
 impl EventLoopDataHolder {
@@ -37,7 +38,8 @@ impl EventLoopDataHolder {
             signal_ctx_ptrs: vec![],
             signal_events: vec![],
             socket_map: HashMap::new(),
-            last_err: None,
+            socket_errs: vec![],
+            break_reason_err: None,
         }
     }
 
@@ -100,15 +102,23 @@ impl EventLoop {
         Ok(())
     }
 
-    fn bind_inet_port(&self, port: u16, cb: impl Fn(i32) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
+    fn break_with_err(&self, err: EventError) {
+        let base_ptr = self.data.borrow().base_ptr();
+        unsafe { event_base_loopbreak(base_ptr) };
+        self.data.borrow_mut().break_reason_err = Some(err);
+    }
+
+    fn bind_inet_port(self: &Rc<Self>, port: u16, cb: impl Fn(i32) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
         let mut sin: sockaddr_in = unsafe { zeroed() };
         sin.sin_family = AF_INET as u8;
         sin.sin_port = port.to_be();
         let sin = sin;
 
+        let self_weak_ref = Rc::downgrade(self);
         let func: Box<dyn Fn(i32)> = Box::new(move |fd| {
-            if let Err(_err) = cb(fd) {
-                todo!()
+            let slf = self_weak_ref.upgrade().expect("Broken prerequisite");
+            if let Err(err) = cb(fd) {
+                slf.break_with_err(err);
             }
         });
         let ctx = Box::new(CallbackContext {
@@ -138,10 +148,12 @@ impl EventLoop {
         Ok(())
     }
 
-    fn handle_signal(&self, sig: u32, cb: impl Fn(u32, i16) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
+    fn handle_signal(self: &Rc<Self>, sig: u32, cb: impl Fn(u32, i16) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
+        let self_weak_ref = Rc::downgrade(self);
         let func: Box<dyn Fn(u32, i16)> = Box::new(move |sig, events| {
-            if let Err(_err) = cb(sig, events) {
-                todo!()
+            let slf = self_weak_ref.upgrade().expect("Broken prerequisite");
+            if let Err(err) = cb(sig, events) {
+                slf.break_with_err(err);
             }
         });
         let ctx = Box::new(CallbackContext {
@@ -180,7 +192,7 @@ impl EventLoop {
         Ok(())
     }
 
-    fn try_new_socket(self: Rc<Self>, fd: i32) -> Result<Rc<Socket>, EventError> {
+    fn try_new_socket(self: &Rc<Self>, fd: i32) -> Result<Rc<Socket>, EventError> {
         let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe {
             let base_ptr = self.data.borrow().base_ptr();
             bufferevent_socket_new(
@@ -193,13 +205,14 @@ impl EventLoop {
             return Err(EventError("Couldn't initialize socket".into()));
         };
 
-        let self_weak_ref = Rc::downgrade(&self);
+        let self_weak_ref = Rc::downgrade(self);
         let socket = Socket::new(fd, bufferevent, move |socket, result| {
             let slf = self_weak_ref.upgrade().expect("Broken prerequisite");
             let fd = socket.data.borrow().fd;
             slf.data.borrow_mut().socket_map.remove(&fd);
             if let Err(err) = result {
-                slf.data.borrow_mut().last_err = Some(err);
+                eprintln!("Socket closed by error: {}", err.0);
+                slf.data.borrow_mut().socket_errs.push(err);
             };
         });
 
@@ -326,8 +339,7 @@ impl Socket {
             let res = read_cb(in_buf.remove_all_bytes());
             self.data.borrow_mut().read_cb = Some(read_cb);
             if let Err(err) = res {
-                eprintln!("Unhandled Error: {}", err.0);
-                todo!();
+                self.close_with_err(err);
             };
         };
     }
@@ -467,7 +479,7 @@ fn try_main() -> Result<(), EventError> {
     })?;
     lp.run()?;
 
-    let last_err = lp.data.borrow().last_err.clone();
+    let last_err = lp.data.borrow().break_reason_err.clone();
     match last_err {
         Some(err) => Err(err),
         None => Ok(()),
