@@ -92,7 +92,8 @@ impl EventLoop {
         let tv_sec = sec.floor() as i64;
         let tv_usec = ((sec - sec.floor()) * 1_000_000f64) as i32;
         let delay: timeval = timeval { tv_sec, tv_usec };
-        unsafe { event_base_loopexit(self.data.borrow().base_ptr(), &delay) };
+        let base_ptr = self.data.borrow().base_ptr();
+        unsafe { event_base_loopexit(base_ptr, &delay) };
         Ok(())
     }
 
@@ -117,9 +118,10 @@ impl EventLoop {
         // context free by pointer holder
         self.data.borrow_mut().connection_ctx_ptrs.push(unsafe { NonNull::new_unchecked(ctx_ptr) });
 
+        let base_ptr = self.data.borrow().base_ptr();
         let listener: NonNull<evconnlistener> = NonNull::new(unsafe {
             evconnlistener_new_bind(
-                self.data.borrow().base_ptr(),
+                base_ptr,
                 Some(c_bind_cb),
                 ctx_ptr as *mut _,
                 LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE,
@@ -149,9 +151,10 @@ impl EventLoop {
         // context free by pointer holder
         self.data.borrow_mut().signal_ctx_ptrs.push(unsafe { NonNull::new_unchecked(ctx_ptr) });
 
+        let base_ptr = self.data.borrow().base_ptr();
         let event: Option<NonNull<event>> = NonNull::new(unsafe {
             event_new(
-                self.data.borrow().base_ptr(),
+                base_ptr,
                 sig as i32,
                 (EV_SIGNAL | EV_PERSIST) as i16,
                 Some(c_signal_cb),
@@ -176,8 +179,9 @@ impl EventLoop {
 
     fn try_new_socket(&self, fd: i32) -> Result<Rc<Socket>, EventError> {
         let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe {
+            let base_ptr = self.data.borrow().base_ptr();
             bufferevent_socket_new(
-                self.data.borrow().base_ptr(),
+                base_ptr,
                 fd,
                 bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32,
             )
@@ -262,9 +266,10 @@ impl Socket {
         // context free by pointer holder
         socket.data.borrow_mut().cb_ctx_ptr = Some(unsafe { NonNull::new_unchecked(ctx_ptr) });
 
+        let base_ptr = socket.data.borrow().bufferevent.as_ptr();
         unsafe {
             bufferevent_setcb(
-                socket.data.borrow().bufferevent.as_ptr(),
+                base_ptr,
                 Some(c_socket_read_cb),
                 Some(c_socket_write_cb),
                 Some(c_socket_event_cb),
@@ -282,15 +287,17 @@ impl Socket {
     }
 
     fn input_buffer(&self) -> SocketBufferRef {
+        let base_ptr = self.data.borrow().bufferevent.as_ptr();
         let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe {
-            bufferevent_get_input(self.data.borrow().bufferevent.as_ptr())
+            bufferevent_get_input(base_ptr)
         }).expect("event buffer pointer shoudn't be null");
         SocketBufferRef { evbuffer }
     }
 
     fn output_buffer(&self) -> SocketBufferRef {
+        let base_ptr = self.data.borrow().bufferevent.as_ptr();
         let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe {
-            bufferevent_get_output(self.data.borrow().bufferevent.as_ptr())
+            bufferevent_get_output(base_ptr)
         }).expect("event buffer pointer shoudn't be null");
         SocketBufferRef { evbuffer }
     }
@@ -313,7 +320,9 @@ impl Socket {
     }
 
     fn on_data(&self, cb: impl Fn(Vec<u8>) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
-        if let Some(ref _read_cb) = self.data.borrow().read_cb {
+        let read_cb = self.data.borrow_mut().read_cb.take();
+        if let Some(read_cb) = read_cb {
+            self.data.borrow_mut().read_cb = Some(read_cb);
             return Err(EventError("Socket data handler already set".into()));
         };
         self.data.borrow_mut().read_cb = Some(Box::new(cb));
