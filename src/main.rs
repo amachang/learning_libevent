@@ -15,6 +15,7 @@ use std::{
 };
 // use debug_cell::RefCell;
 
+#[derive(Clone)]
 struct EventError(String);
 
 struct EventLoopDataHolder {
@@ -24,6 +25,7 @@ struct EventLoopDataHolder {
     signal_ctx_ptrs: Vec<NonNull<CallbackContext<Box<dyn Fn(u32, i16)>, u32>>>,
     signal_events: Vec<NonNull<event>>,
     socket_map: HashMap<i32, Rc<Socket>>,
+    last_err: Option<EventError>,
 }
 
 impl EventLoopDataHolder {
@@ -35,6 +37,7 @@ impl EventLoopDataHolder {
             signal_ctx_ptrs: vec![],
             signal_events: vec![],
             socket_map: HashMap::new(),
+            last_err: None,
         }
     }
 
@@ -177,7 +180,7 @@ impl EventLoop {
         Ok(())
     }
 
-    fn try_new_socket(&self, fd: i32) -> Result<Rc<Socket>, EventError> {
+    fn try_new_socket(self: Rc<Self>, fd: i32) -> Result<Rc<Socket>, EventError> {
         let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe {
             let base_ptr = self.data.borrow().base_ptr();
             bufferevent_socket_new(
@@ -189,7 +192,17 @@ impl EventLoop {
         let Some(bufferevent) = bufferevent else {
             return Err(EventError("Couldn't initialize socket".into()));
         };
-        let socket = Socket::new(fd, bufferevent);
+
+        let self_weak_ref = Rc::downgrade(&self);
+        let socket = Socket::new(fd, bufferevent, move |socket, result| {
+            let slf = self_weak_ref.upgrade().expect("Broken prerequisite");
+            let fd = socket.data.borrow().fd;
+            slf.data.borrow_mut().socket_map.remove(&fd);
+            if let Err(err) = result {
+                slf.data.borrow_mut().last_err = Some(err);
+            };
+        });
+
         self.data.borrow_mut().socket_map.insert(fd, socket.clone());
         Ok(socket)
     }
@@ -202,19 +215,21 @@ enum SocketEventKind {
 }
 
 struct SocketDataHolder {
-    _fd: i32,
+    fd: i32,
     bufferevent: NonNull<bufferevent>,
     cb_ctx_ptr: Option<NonNull<CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>>>,
     read_cb: Option<Box<dyn Fn(Vec<u8>) -> Result<(), EventError>>>,
+    close_cb: Option<Box<dyn FnOnce(&Socket, Result<(), EventError>)>>,
 }
 
 impl SocketDataHolder {
     fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Self {
         Self {
-            _fd: fd,
+            fd,
             bufferevent,
             cb_ctx_ptr: None,
             read_cb: None,
+            close_cb: None,
         }
     }
 }
@@ -236,10 +251,12 @@ struct Socket {
 }
 
 impl Socket {
-    fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Rc<Self> {
+    fn new(fd: i32, bufferevent: NonNull<bufferevent>, close_cb: impl FnOnce(&Socket, Result<(), EventError>) + 'static) -> Rc<Self> {
         let data = SocketDataHolder::new(fd, bufferevent);
         let data = RefCell::new(data);
         let socket = Rc::new(Self { data });
+
+        socket.data.borrow_mut().close_cb = Some(Box::new(close_cb));
 
         let socket_weak_ref = Rc::downgrade(&socket);
         let func: Box<dyn Fn(SocketEventKind)> = Box::new(move |kind| {
@@ -251,8 +268,8 @@ impl Socket {
                 SocketEventKind::Write => {
                     socket.handle_write();
                 },
-                SocketEventKind::Event(_events) => {
-                    todo!();
+                SocketEventKind::Event(events) => {
+                    socket.handle_event(events);
                 },
             }
         });
@@ -319,6 +336,34 @@ impl Socket {
         // currently nothing to do
     }
 
+    fn handle_event(&self, events: i16) {
+        let eof = (BEV_EVENT_EOF as i16 & events) != 0;
+        let error = (BEV_EVENT_ERROR as i16 & events) != 0;
+        let timeout = (BEV_EVENT_TIMEOUT as i16 & events) != 0;
+        let connected = (BEV_EVENT_TIMEOUT as i16 & events) != 0;
+
+        // at least one flag is on
+        assert!(eof || error || timeout || connected);
+
+        // at most one flag is on
+        let count =
+            if eof { 1 } else { 0 } +
+            if error { 1 } else { 0 } +
+            if timeout { 1 } else { 0 } +
+            if connected { 1 } else { 0 };
+        assert_eq!(count, 1);
+
+        if eof {
+            self.close();
+        } else if error {
+            self.close_with_err(EventError("Error event occurred in socket.".into()));
+        } else if timeout {
+            // currently to do nothing, we didn't use timeout yet
+        } else if connected {
+            // currently to do nothing
+        }
+    }
+
     fn on_data(&self, cb: impl Fn(Vec<u8>) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
         let read_cb = self.data.borrow_mut().read_cb.take();
         if let Some(read_cb) = read_cb {
@@ -333,6 +378,20 @@ impl Socket {
         let out_buf = self.output_buffer();
         out_buf.add_bytes(bytes)?;
         Ok(())
+    }
+
+    fn close_with_err(&self, err: EventError) {
+        let close_cb = self.data.borrow_mut().close_cb.take();
+        if let Some(close_cb) = close_cb {
+            close_cb(self, Err(err));
+        };
+    }
+
+    fn close(&self) {
+        let close_cb = self.data.borrow_mut().close_cb.take();
+        if let Some(close_cb) = close_cb {
+            close_cb(self, Ok(()));
+        };
     }
 }
 
@@ -406,7 +465,13 @@ fn try_main() -> Result<(), EventError> {
         lp.exit(2.0)?;
         Ok(())
     })?;
-    lp.run()
+    lp.run()?;
+
+    let last_err = lp.data.borrow().last_err.clone();
+    match last_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 extern "C" fn c_bind_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, ctx_ptr: *mut c_void) {
