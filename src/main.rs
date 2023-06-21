@@ -5,191 +5,157 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::{
-    collections::HashMap,
-    rc::{
-        Rc,
-        Weak,
-    },
-    cell::RefCell,
-    mem::{
-        zeroed,
-        size_of,
-    },
-    process::exit,
-    ptr::{
-        null,
-        NonNull,
-    },
+    collections::*,
+    marker::*,
+    rc::*,
+    mem::*,
+    ptr::*,
     ffi::*,
+    cell::*,
 };
+// use debug_cell::RefCell;
 
-#[derive(Debug)]
 struct EventError(String);
 
-#[derive(Debug)]
-struct EventLoop {
+struct EventLoopDataHolder {
     base: NonNull<event_base>,
+    connection_ctx_ptrs: Vec<NonNull<CallbackContext<Box<dyn Fn(i32)>, ()>>>,
+    connection_listeners: Vec<NonNull<evconnlistener>>,
+    signal_ctx_ptrs: Vec<NonNull<CallbackContext<Box<dyn Fn(u32, i16)>, u32>>>,
+    signal_events: Vec<NonNull<event>>,
+    socket_map: HashMap<i32, Rc<Socket>>,
 }
 
-impl EventLoop {
-    fn try_new() -> Result<EventLoop, EventError> {
-        let base: Option<NonNull<event_base>> = NonNull::new(unsafe { event_base_new() });
-        match base {
-            None => Err(EventError("Could not initialize libevent!".into())),
-            Some(base) => Ok(EventLoop { base }),
-        }
-    }
-
-    fn run(&self) {
-        unsafe { event_base_dispatch(self.base.as_ptr()) };
-    }
-
-    fn exit(&self, sec: f64) {
-        let tv_sec = sec.floor() as i64;
-        let tv_usec = ((sec - sec.floor()) * 1_000_000f64) as i32;
-        let delay: timeval = timeval { tv_sec, tv_usec };
-        unsafe { event_base_loopexit(self.base.as_ptr(), &delay) };
-    }
-
-    unsafe fn as_ptr(&self) -> *mut event_base {
-        self.base.as_ptr()
-    }
-}
-
-impl Drop for EventLoop {
-    fn drop(&mut self) {
-        unsafe { event_base_free(self.base.as_ptr()) };
-    }
-}
-
-#[derive(Debug)]
-struct EventManager<'a> {
-    lp: &'a EventLoop,
-    connection_listeners: Vec<ConnectionListener>,
-    signal_listeners: Vec<SignalListener>,
-    socket_map: HashMap<i32, SocketListener>,
-}
-
-impl<'a> EventManager<'a> {
-    fn new(lp: &'a EventLoop) -> EventManager<'a> {
-        EventManager {
-            lp,
+impl EventLoopDataHolder {
+    fn new(base: NonNull<event_base>) -> Self {
+        Self {
+            base,
+            connection_ctx_ptrs: vec![],
             connection_listeners: vec![],
-            signal_listeners: vec![],
+            signal_ctx_ptrs: vec![],
+            signal_events: vec![],
             socket_map: HashMap::new(),
         }
     }
 
-    fn bind_inet_port(&mut self, lp: &EventLoop, port: u16, cb: impl Fn(i32)) -> Result<(), EventError> {
-        let listener = ConnectionListener::try_new(lp, port, cb)?;
-        self.connection_listeners.push(listener);
-        Ok(())
-    }
-
-    fn handle_signal(&mut self, lp: &EventLoop, sig: u32, cb: impl Fn(i16)) -> Result<(), EventError> {
-        let listener = SignalListener::try_new(lp, sig, cb)?;
-        self.signal_listeners.push(listener);
-        Ok(())
-    }
-
-    fn listen_socket(&mut self, fd: i32, read_cb: impl Fn(&Socket), write_cb: impl Fn(&Socket)) -> Result<(), EventError> {
-        let listener = SocketListener::try_new(self.lp, fd, read_cb, write_cb, |socket, events| {
-            if (events & BEV_EVENT_READING as i16) != 0 {
-                eprintln!("Event ocurred in reading.");
-            }
-            if (events & BEV_EVENT_WRITING as i16) != 0 {
-                eprintln!("Event ocurred in writing.");
-            }
-            if (events & BEV_EVENT_EOF as i16) != 0 {
-                eprintln!("Eof reached.");
-            }
-            if (events & BEV_EVENT_ERROR as i16) != 0 {
-                eprintln!("Unrecoverable error encountered.");
-            }
-            if (events & BEV_EVENT_TIMEOUT as i16) != 0 {
-                eprintln!("User-specified timeout reached.");
-            }
-            if (events & BEV_EVENT_CONNECTED as i16) != 0 {
-                eprintln!("Connect operation finished.");
-            }
-            self.unlisten_socket(socket);
-        })?;
-        self.socket_map.insert(fd, listener);
-        Ok(())
-    }
-
-    fn unlisten_socket(&mut self, socket: &Socket) {
-        self.socket_map.remove(&socket.fd);
+    fn base_ptr(&self) -> *mut event_base {
+        self.base.as_ptr()
     }
 }
 
-#[derive(Debug)]
-struct ConnectionListener {
-    listener: NonNull<evconnlistener>,
+impl Drop for EventLoopDataHolder {
+    fn drop(&mut self) {
+        // drop all sockets
+        self.socket_map = HashMap::new();
+
+        unsafe { event_base_free(self.base.as_ptr()) }
+
+        for ctx_ptr in &self.connection_ctx_ptrs {
+            // when dropping box, free()
+            unsafe { Box::from_raw(ctx_ptr.as_ptr()) };
+        }
+        for listener in &self.connection_listeners {
+            unsafe { evconnlistener_free(listener.as_ptr()) };
+        }
+
+        for ctx_ptr in &self.signal_ctx_ptrs {
+            // when dropping box, free()
+            unsafe { Box::from_raw(ctx_ptr.as_ptr()) };
+        }
+        for event in &self.signal_events {
+            unsafe { event_free(event.as_ptr()) };
+        }
+        println!("free all pointers");
+    }
 }
 
-impl ConnectionListener {
-    fn try_new(lp: &EventLoop, port: u16, listener_cb: impl Fn(i32)) -> Result<ConnectionListener, EventError> {
+struct EventLoop {
+    data: RefCell<EventLoopDataHolder>,
+}
+
+impl EventLoop {
+    fn try_new() -> Result<Rc<Self>, EventError> {
+        let Some(base) = NonNull::new(unsafe { event_base_new() }) else {
+            return Err(EventError("Couldn't initialize event loop".into()));
+        };
+        let data = RefCell::new(EventLoopDataHolder::new(base));
+        Ok(Rc::new(Self { data }))
+    }
+
+    fn run(&self) -> Result<(), EventError> {
+        let base_ptr = self.data.borrow().base_ptr();
+        unsafe { event_base_dispatch(base_ptr) };
+        Ok(())
+    }
+
+    fn exit(&self, sec: f64) -> Result<(), EventError> {
+        let tv_sec = sec.floor() as i64;
+        let tv_usec = ((sec - sec.floor()) * 1_000_000f64) as i32;
+        let delay: timeval = timeval { tv_sec, tv_usec };
+        unsafe { event_base_loopexit(self.data.borrow().base_ptr(), &delay) };
+        Ok(())
+    }
+
+    fn bind_inet_port(&self, port: u16, cb: impl Fn(i32) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
         let mut sin: sockaddr_in = unsafe { zeroed() };
         sin.sin_family = AF_INET as u8;
-        sin.sin_port = Self::htons(port);
+        sin.sin_port = port.to_be();
+        let sin = sin;
 
-        let listener_cb: Box<Box<dyn Fn(i32)>> = Box::new(Box::new(listener_cb));
+        let func: Box<dyn Fn(i32)> = Box::new(move |fd| {
+            if let Err(_err) = cb(fd) {
+                todo!()
+            }
+        });
+        let ctx = Box::new(CallbackContext {
+            func: func,
+            arg: (),
+        });
+        // move into pointer
+        let ctx_ptr: *mut CallbackContext<Box<dyn Fn(i32)>, ()> = Box::into_raw(ctx);
 
-        extern "C" fn c_listener_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, listener_cb: *mut c_void) {
-            let listener_cb: &Box<dyn Fn(i32)> = unsafe { &*(listener_cb as *mut _) };
-            listener_cb(fd);
-        }
+        // context free by pointer holder
+        self.data.borrow_mut().connection_ctx_ptrs.push(unsafe { NonNull::new_unchecked(ctx_ptr) });
 
-        let listener: Option<NonNull<evconnlistener>> = NonNull::new(unsafe {
+        let listener: NonNull<evconnlistener> = NonNull::new(unsafe {
             evconnlistener_new_bind(
-                lp.as_ptr(),
-                Some(c_listener_cb),
-                Box::into_raw(listener_cb) as *mut _,
+                self.data.borrow().base_ptr(),
+                Some(c_bind_cb),
+                ctx_ptr as *mut _,
                 LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE,
                 -1,
-                &sin as *const sockaddr_in as *const sockaddr,
+                &sin as *const _ as *const _,
                 size_of::<sockaddr_in>() as i32,
             )
+        }).expect("Couldn't initialize eveconnlistener");
+
+        self.data.borrow_mut().connection_listeners.push(listener);
+        Ok(())
+    }
+
+    fn handle_signal(&self, sig: u32, cb: impl Fn(u32, i16) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
+        let func: Box<dyn Fn(u32, i16)> = Box::new(move |sig, events| {
+            if let Err(_err) = cb(sig, events) {
+                todo!()
+            }
         });
-        match listener {
-            None => Err(EventError("Could not initialize connection Listener!".into())),
-            Some(listener) => Ok(ConnectionListener { listener }),
-        }
-    }
+        let ctx = Box::new(CallbackContext {
+            func: func,
+            arg: sig,
+        });
+        // move into pointer
+        let ctx_ptr: *mut CallbackContext<Box<dyn Fn(u32, i16)>, u32> = Box::into_raw(ctx);
 
-    fn htons(u: u16) -> u16 {
-        u.to_be()
-    }
-}
-
-impl Drop for ConnectionListener {
-    fn drop(&mut self) {
-        unsafe { evconnlistener_free(self.listener.as_ptr()) };
-    }
-}
-
-#[derive(Debug)]
-struct SignalListener {
-    event: NonNull<event>,
-}
-
-impl SignalListener {
-    fn try_new(lp: &EventLoop, sig: u32, listener_cb: impl Fn(i16)) -> Result<SignalListener, EventError> {
-        let listener_cb: Box<Box<dyn Fn(i16)>> = Box::new(Box::new(listener_cb));
-
-        extern "C" fn c_listener_cb(_sig: i32, events: i16, listener_cb: *mut c_void) {
-            let listener_cb: &Box<dyn Fn(i16)> = unsafe { &*(listener_cb as *mut _) };
-            listener_cb(events);
-        }
+        // context free by pointer holder
+        self.data.borrow_mut().signal_ctx_ptrs.push(unsafe { NonNull::new_unchecked(ctx_ptr) });
 
         let event: Option<NonNull<event>> = NonNull::new(unsafe {
             event_new(
-                lp.as_ptr(),
+                self.data.borrow().base_ptr(),
                 sig as i32,
                 (EV_SIGNAL | EV_PERSIST) as i16,
-                Some(c_listener_cb),
-                Box::into_raw(listener_cb) as *mut _
+                Some(c_signal_cb),
+                ctx_ptr as *mut _
             )
         });
 
@@ -200,194 +166,272 @@ impl SignalListener {
         let add_result = unsafe { event_add(event.as_ptr(), null()) };
 
         if add_result < 0 {
+            unsafe { event_free(event.as_ptr()) };
             return Err(EventError("Could not add a signal event!".into()));
         };
 
-        Ok(SignalListener { event })
+        self.data.borrow_mut().signal_events.push(event);
+        Ok(())
     }
-}
 
-impl Drop for SignalListener {
-    fn drop(&mut self) {
-        unsafe { event_free(self.event.as_ptr()) };
-    }
-}
-
-#[derive(Debug)]
-struct SocketListener {
-    _socket: Rc<Socket>,
-}
-
-impl SocketListener {
-    fn try_new(lp: &EventLoop, fd: i32, read_cb: impl FnMut(&Socket), write_cb: impl FnMut(&Socket), event_cb: impl FnMut(&Socket, i16)) -> Result<SocketListener, EventError> {
-        let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe { bufferevent_socket_new(lp.as_ptr(), fd, bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32) });
+    fn try_new_socket(&self, fd: i32) -> Result<Rc<Socket>, EventError> {
+        let bufferevent: Option<NonNull<bufferevent>> = NonNull::new(unsafe {
+            bufferevent_socket_new(
+                self.data.borrow().base_ptr(),
+                fd,
+                bufferevent_options_BEV_OPT_CLOSE_ON_FREE as i32,
+            )
+        });
         let Some(bufferevent) = bufferevent else {
-            return Err(EventError("Error constructing bufferevent!".into()))
+            return Err(EventError("Couldn't initialize socket".into()));
         };
-
-        let socket = Rc::new(Socket::new(fd, bufferevent));
-        let socket_weak_ref = Rc::downgrade(&socket);
-
-        let ctx: Box<(
-            Weak<Socket>,
-            Box<dyn FnMut(&Socket)>,
-            Box<dyn FnMut(&Socket)>,
-            Box<dyn FnMut(&Socket, i16)>
-        )> = Box::new((socket_weak_ref, Box::new(read_cb), Box::new(write_cb), Box::new(event_cb)));
-
-        extern "C" fn c_read_cb(bev: *mut bufferevent, ctx: *mut c_void) {
-            let ctx: &mut (
-                Weak<Socket>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket, i16)>
-            ) = unsafe { &mut *(ctx as *mut _) };
-            let (socket_weak_ref, read_cb, _write_cb, _event_cb) = ctx;
-            if let Some(socket) = socket_weak_ref.upgrade() {
-                assert_eq!(socket.bufferevent.as_ptr(), bev);
-                read_cb(&socket)
-            };
-        }
-
-        extern "C" fn c_write_cb(bev: *mut bufferevent, ctx: *mut c_void) {
-            let ctx: &mut (
-                Weak<Socket>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket, i16)>
-            ) = unsafe { &mut *(ctx as *mut _) };
-            let (socket_weak_ref, _read_cb, write_cb, _event_cb) = ctx;
-            if let Some(socket) = socket_weak_ref.upgrade() {
-                assert_eq!(socket.bufferevent.as_ptr(), bev);
-                write_cb(&socket)
-            }
-        }
-
-        extern "C" fn c_event_cb(bev: *mut bufferevent, events: i16, ctx: *mut c_void) {
-            let ctx: &mut (
-                Weak<Socket>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket)>,
-                Box<dyn FnMut(&Socket, i16)>
-            ) = unsafe { &mut *(ctx as *mut _) };
-            let (socket_weak_ref, _read_cb, _write_cb, event_cb) = ctx;
-            if let Some(socket) = socket_weak_ref.upgrade() {
-                assert_eq!(socket.bufferevent.as_ptr(), bev);
-                event_cb(&socket, events)
-            }
-        }
-
-        unsafe { bufferevent_setcb(bufferevent.as_ptr(), Some(c_read_cb), Some(c_write_cb), Some(c_event_cb), Box::into_raw(ctx) as *mut _) };
-        unsafe { bufferevent_enable(bufferevent.as_ptr(), (EV_WRITE | EV_READ) as i16) };
-        Ok(SocketListener { _socket: socket })
+        let socket = Socket::new(fd, bufferevent);
+        self.data.borrow_mut().socket_map.insert(fd, socket.clone());
+        Ok(socket)
     }
 }
 
-#[derive(Debug)]
-struct Socket {
-    fd: i32,
+enum SocketEventKind {
+    Read,
+    Write,
+    Event(i16),
+}
+
+struct SocketDataHolder {
+    _fd: i32,
     bufferevent: NonNull<bufferevent>,
+    cb_ctx_ptr: Option<NonNull<CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>>>,
+    read_cb: Option<Box<dyn Fn(Vec<u8>) -> Result<(), EventError>>>,
+}
+
+impl SocketDataHolder {
+    fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Self {
+        Self {
+            _fd: fd,
+            bufferevent,
+            cb_ctx_ptr: None,
+            read_cb: None,
+        }
+    }
+}
+
+impl Drop for SocketDataHolder {
+    fn drop(&mut self) {
+        unsafe{ bufferevent_free(self.bufferevent.as_ptr()) }
+
+        if let Some(cb_ctx_ptr) = self.cb_ctx_ptr {
+            // free()
+            unsafe { Box::from_raw(cb_ctx_ptr.as_ptr()) };
+        }
+        println!("free all socket data");
+    }
+}
+
+struct Socket {
+    data: RefCell<SocketDataHolder>,
 }
 
 impl Socket {
-    fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Socket {
-        Socket { fd, bufferevent }
+    fn new(fd: i32, bufferevent: NonNull<bufferevent>) -> Rc<Self> {
+        let data = SocketDataHolder::new(fd, bufferevent);
+        let data = RefCell::new(data);
+        let socket = Rc::new(Self { data });
+
+        let socket_weak_ref = Rc::downgrade(&socket);
+        let func: Box<dyn Fn(SocketEventKind)> = Box::new(move |kind| {
+            let socket = socket_weak_ref.upgrade().expect("Broken prerequisite");
+            match kind {
+                SocketEventKind::Read => {
+                    socket.handle_read();
+                },
+                SocketEventKind::Write => {
+                    socket.handle_write();
+                },
+                SocketEventKind::Event(_events) => {
+                    todo!();
+                },
+            }
+        });
+        let ctx = Box::new(CallbackContext {
+            func: func,
+            arg: (),
+        });
+        // move into pointer
+        let ctx_ptr: *mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()> = Box::into_raw(ctx);
+
+        // context free by pointer holder
+        socket.data.borrow_mut().cb_ctx_ptr = Some(unsafe { NonNull::new_unchecked(ctx_ptr) });
+
+        unsafe {
+            bufferevent_setcb(
+                socket.data.borrow().bufferevent.as_ptr(),
+                Some(c_socket_read_cb),
+                Some(c_socket_write_cb),
+                Some(c_socket_event_cb),
+                ctx_ptr as *mut _,
+            )
+        };
+        unsafe {
+            bufferevent_enable(
+                socket.data.borrow().bufferevent.as_ptr(),
+                (EV_WRITE | EV_READ) as i16
+            )
+        };
+
+        socket
     }
 
     fn input_buffer(&self) -> SocketBufferRef {
-        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_input(self.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe {
+            bufferevent_get_input(self.data.borrow().bufferevent.as_ptr())
+        }).expect("event buffer pointer shoudn't be null");
         SocketBufferRef { evbuffer }
     }
 
     fn output_buffer(&self) -> SocketBufferRef {
-        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe { bufferevent_get_output(self.bufferevent.as_ptr()) }).expect("event buffer pointer shoudn't be null");
+        let evbuffer: NonNull<evbuffer> = NonNull::new(unsafe {
+            bufferevent_get_output(self.data.borrow().bufferevent.as_ptr())
+        }).expect("event buffer pointer shoudn't be null");
         SocketBufferRef { evbuffer }
     }
 
-}
+    fn handle_read(&self) {
+        let read_cb = self.data.borrow_mut().read_cb.take();
+        if let Some(read_cb) = read_cb {
+            let in_buf = self.input_buffer();
+            let res = read_cb(in_buf.remove_all_bytes());
+            self.data.borrow_mut().read_cb = Some(read_cb);
+            if let Err(err) = res {
+                eprintln!("Unhandled Error: {}", err.0);
+                todo!();
+            };
+        };
+    }
 
-impl Drop for Socket {
-    fn drop(&mut self) {
-        unsafe { bufferevent_free(self.bufferevent.as_ptr()) };
+    fn handle_write(&self) {
+        // currently nothing to do
+    }
+
+    fn on_data(&self, cb: impl Fn(Vec<u8>) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
+        if let Some(ref _read_cb) = self.data.borrow().read_cb {
+            return Err(EventError("Socket data handler already set".into()));
+        };
+        self.data.borrow_mut().read_cb = Some(Box::new(cb));
+        Ok(())
+    }
+
+    fn write(&self, bytes: Vec<u8>) -> Result<(), EventError> {
+        let out_buf = self.output_buffer();
+        out_buf.add_bytes(bytes)?;
+        Ok(())
     }
 }
 
-#[derive(Debug)]
 struct SocketBufferRef {
     evbuffer: NonNull<evbuffer>
 }
 
 impl SocketBufferRef {
-    fn len(&mut self) -> usize {
+    fn len(&self) -> usize {
         unsafe { evbuffer_get_length(self.evbuffer.as_ptr()) }
     }
 
-    fn move_data(&mut self, out_buf: &mut SocketBufferRef, size: usize) -> usize {
-        let writes = unsafe { evbuffer_remove_buffer(self.evbuffer.as_ptr(), out_buf.evbuffer.as_ptr(), size) };
-        writes as usize
+    fn remove_all_bytes(&self) -> Vec<u8> {
+        let len = self.len();
+        let mut buffer = Vec::with_capacity(len);
+        let buffer_ptr = buffer.as_mut_ptr();
+        let reads = unsafe { evbuffer_remove(self.evbuffer.as_ptr(), buffer_ptr as *mut _, len) };
+        assert_eq!(reads as usize, len);
+        unsafe { buffer.set_len(len) };
+        assert_eq!(self.len(), 0usize);
+        return buffer;
+    }
+
+    fn add_bytes(&self, buffer: Vec<u8>) -> Result<(), EventError> {
+        let len = buffer.len();
+        let buffer_ptr = buffer.as_ptr();
+        let ret = unsafe { evbuffer_add(self.evbuffer.as_ptr(), buffer_ptr as *const _, len) };
+        if ret != 0 {
+            return Err(EventError("Failed to write to socket output buffer".into()));
+        };
+        Ok(())
     }
 }
 
-const PORT: u16 = 9995;
+struct CallbackContext<F, A> {
+    func: F,
+    arg: A,
+}
 
 fn main() {
     match try_main() {
-        Err(err) => {
-            eprintln!("Error: {}", err.0);
-            exit(1);
-        },
+        Err(EventError(message)) => eprintln!("Error: {}", message),
         _ => (),
     }
 }
 
 fn try_main() -> Result<(), EventError> {
+    let port = 9995u16;
     let lp = EventLoop::try_new()?;
-    let manager = Rc::new(RefCell::new(EventManager::new(&lp)));
+    let lp_weak_ref = Rc::downgrade(&lp);
+    lp.bind_inet_port(port, move |fd| {
+        let lp = lp_weak_ref.upgrade().expect("Broken prerequisite");
+        let socket = lp.try_new_socket(fd)?;
+        let socket_weak_ref = Rc::downgrade(&socket);
+        socket.on_data(move |bytes| {
+            let socket = socket_weak_ref.upgrade().expect("Broken prerequisite");
 
-    let manager_weak_ref = Rc::downgrade(&manager);
-    manager.borrow_mut().bind_inet_port(&lp, PORT, move |fd: i32| {
-        if let Some(manager) = manager_weak_ref.upgrade() {
-            let result = manager.borrow_mut().listen_socket(
-                fd,
-                move |socket| {
-                    let mut in_buf = socket.input_buffer();
-                    let mut out_buf = socket.output_buffer();
-                    loop {
-                        let inputs = in_buf.len();
-                        let writes = in_buf.move_data(&mut out_buf, inputs);
-                        if inputs <= writes {
-                            break;
-                        }
-                    };
-                    println!("Received");
-                },
-                move |socket| {
-                    let mut out_buf = socket.output_buffer();
-                    let remaining_outputs = out_buf.len();
-                    if remaining_outputs == 0 {
-                        println!("Answered");
-                    }
-                },
-            );
-            if let Err(_err) = result {
-                todo!();
-            };
-        }
+            println!("Received");
+            socket.write(bytes)?;
+            println!("Answered");
+            Ok(())
+        })?;
+        Ok(())
     })?;
 
-    let manager_weak_ref = Rc::downgrade(&manager);
-    manager.borrow_mut().handle_signal(&lp, SIGINT, move |_events: i16| {
-        if let Some(manager) = manager_weak_ref.upgrade() {
-            let lp = manager.borrow().lp;
-            println!("Caught an interrupt signal; exiting cleanly in two seconds.");
-            lp.exit(2.0);
-        }
+    let lp_weak_ref = Rc::downgrade(&lp);
+    lp.handle_signal(SIGINT, move |_sig, _events| {
+        let lp = lp_weak_ref.upgrade().expect("Broken prerequisite");
+
+        println!("Caught an interrupt signal; exiting cleanly in two seconds.");
+        lp.exit(2.0)?;
+        Ok(())
     })?;
-
-    println!("Start listening the port: {}", PORT);
-    lp.run();
-
-    println!("done");
-    Ok(())
+    lp.run()
 }
 
+extern "C" fn c_bind_cb(_listener: *mut evconnlistener, fd: i32, _sa: *mut sockaddr, _socklen: i32, ctx_ptr: *mut c_void) {
+    let ctx: &mut CallbackContext<Box<dyn Fn(i32)>, ()> = unsafe {
+        &mut *(ctx_ptr as *mut CallbackContext<Box<dyn Fn(i32)>, ()>)
+    };
+    (ctx.func)(fd);
+}
+
+extern "C" fn c_signal_cb(sig: i32, events: i16, ctx_ptr: *mut c_void) {
+    let ctx: &mut CallbackContext<Box<dyn Fn(u32, i16)>, u32> = unsafe {
+        &mut *(ctx_ptr as *mut CallbackContext<Box<dyn Fn(u32, i16)>, u32>)
+    };
+    assert!(ctx.arg == sig as u32);
+    (ctx.func)(ctx.arg, events);
+}
+
+extern "C" fn c_socket_read_cb(_bev: *mut bufferevent, ctx_ptr: *mut c_void) {
+    let ctx: &mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()> = unsafe {
+        &mut *(ctx_ptr as *mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>)
+    };
+    (ctx.func)(SocketEventKind::Read);
+}
+
+extern "C" fn c_socket_write_cb(_bev: *mut bufferevent, ctx_ptr: *mut c_void) {
+    let ctx: &mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()> = unsafe {
+        &mut *(ctx_ptr as *mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>)
+    };
+    (ctx.func)(SocketEventKind::Write);
+}
+
+extern "C" fn c_socket_event_cb(_bev: *mut bufferevent, events: i16, ctx_ptr: *mut c_void) {
+    let ctx: &mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()> = unsafe {
+        &mut *(ctx_ptr as *mut CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>)
+    };
+    (ctx.func)(SocketEventKind::Event(events));
+}
