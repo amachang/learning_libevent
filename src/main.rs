@@ -231,7 +231,7 @@ struct SocketDataHolder {
     fd: i32,
     bufferevent: NonNull<bufferevent>,
     cb_ctx_ptr: Option<NonNull<CallbackContext<Box<dyn Fn(SocketEventKind)>, ()>>>,
-    read_cb: Option<Box<dyn Fn(Vec<u8>) -> Result<(), EventError>>>,
+    read_cb: Option<Rc<dyn Fn(Vec<u8>) -> Result<(), EventError>>>,
     close_cb: Option<Box<dyn FnOnce(&Socket, Result<(), EventError>)>>,
 }
 
@@ -333,11 +333,10 @@ impl Socket {
     }
 
     fn handle_read(&self) {
-        let read_cb = self.data.borrow_mut().read_cb.take();
+        let read_cb = self.data.borrow_mut().read_cb.clone();
         if let Some(read_cb) = read_cb {
             let in_buf = self.input_buffer();
             let res = read_cb(in_buf.remove_all_bytes());
-            self.data.borrow_mut().read_cb = Some(read_cb);
             if let Err(err) = res {
                 self.close_with_err(err);
             };
@@ -377,12 +376,11 @@ impl Socket {
     }
 
     fn on_data(&self, cb: impl Fn(Vec<u8>) -> Result<(), EventError> + 'static) -> Result<(), EventError> {
-        let read_cb = self.data.borrow_mut().read_cb.take();
-        if let Some(read_cb) = read_cb {
-            self.data.borrow_mut().read_cb = Some(read_cb);
+        let read_cb = self.data.borrow_mut().read_cb.clone();
+        if let Some(_) = read_cb {
             return Err(EventError("Socket data handler already set".into()));
         };
-        self.data.borrow_mut().read_cb = Some(Box::new(cb));
+        self.data.borrow_mut().read_cb = Some(Rc::new(cb));
         Ok(())
     }
 
